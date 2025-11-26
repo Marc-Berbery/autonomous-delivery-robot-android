@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">Autonomous_Delivery_Robot</string>
+    <string name="voice_control">Voice Control</string>
+    <string name="listening">Listening...</string>
+    <string name="processing">Processing...</string>
+    <string name="available_commands">Available commands:\nforward, backward, left, right, stop</string>
+    <string name="cancel">Cancel</string>
+</resources>

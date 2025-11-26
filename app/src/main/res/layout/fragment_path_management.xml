@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/background"
+    android:padding="16dp">
+
+    <!-- Title -->
+    <TextView
+        android:id="@+id/titleTextView"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Path Management"
+        android:textSize="22sp"
+        android:textStyle="bold"
+        android:textColor="@color/on_background"
+        android:layout_marginBottom="16dp"
+        android:layout_alignParentTop="true"
+        android:layout_centerHorizontal="true" />
+
+    <!-- Header Section -->
+    <LinearLayout
+        android:id="@+id/layoutAddPath"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_below="@id/titleTextView"
+        android:orientation="vertical"
+        android:background="@drawable/bg_rounded_card"
+        android:padding="16dp"
+        android:elevation="2dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Select Location:"
+            android:textStyle="bold"
+            android:textColor="@color/on_surface"
+            android:textSize="15sp" />
+
+        <Spinner
+            android:id="@+id/spinnerLocations"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="16dp"
+            android:backgroundTint="@color/on_surface_medium"
+            android:popupBackground="@color/surface_variant" />
+
+        <Button
+            android:id="@+id/buttonAddPath"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Record New Path"
+            android:textColor="@color/on_primary"
+            android:textAllCaps="false"
+            android:textSize="15sp"
+            android:backgroundTint="@color/primary"
+            android:layout_marginTop="8dp" />
+    </LinearLayout>
+
+    <!-- Empty state view -->
+    <FrameLayout
+        android:id="@+id/emptyStateContainer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_below="@id/layoutAddPath"
+        android:layout_marginTop="16dp"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:orientation="vertical"
+            android:gravity="center">
+
+            <ImageView
+                android:layout_width="120dp"
+                android:layout_height="120dp"
+                android:src="@drawable/ic_path"
+                android:alpha="0.7"
+                android:contentDescription="No paths" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="No Paths Yet"
+                android:textColor="@color/on_background"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:layout_marginTop="16dp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Record your first path to get started"
+                android:textColor="@color/on_surface_medium"
+                android:textSize="14sp"
+                android:layout_marginTop="8dp" />
+        </LinearLayout>
+    </FrameLayout>
+
+    <!-- List Section -->
+    <ListView
+        android:id="@+id/listViewPaths"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_below="@id/layoutAddPath"
+        android:layout_marginTop="16dp"
+        android:divider="@color/surface_variant"
+        android:dividerHeight="1dp"
+        android:background="@color/background" />
+
+    <!-- Loading Spinner -->
+    <ProgressBar
+        android:id="@+id/progressLoading"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_centerInParent="true"
+        android:visibility="gone" />
+
+</RelativeLayout>

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Material 3 color scheme (Dark Theme) -->
+    <color name="primary">#4F73FF</color>
+    <color name="primary_variant">#3D5AFE</color>
+    <color name="on_primary">#FFFFFF</color>
+    <color name="secondary">#50E2C2</color>
+    <color name="secondary_variant">#3DD8B6</color>
+    <color name="on_secondary">#000000</color>
+    <color name="background">#121212</color>
+    <color name="surface">#1E1E1E</color>
+    <color name="surface_variant">#2A2A2A</color>
+    <color name="error">#CF6679</color>
+    <color name="on_background">#FFFFFF</color>
+    <color name="on_surface">#FFFFFF</color>
+    <color name="on_surface_medium">#CCCCCC</color>
+    <color name="on_surface_disabled">#66FFFFFF</color>
+    <color name="on_error">#000000</color>
+    <color name="status_bar">#000000</color>
+
+    <!-- Bottom navigation colors -->
+    <color name="nav_selected">#4F73FF</color>
+    <color name="nav_unselected">#99FFFFFF</color>
+
+    <!-- Other utility colors -->
+    <color name="success">#4CAF50</color>
+    <color name="warning">#FFC107</color>
+    <color name="info">#2196F3</color>
+</resources>

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:padding="24dp"
+    android:background="#121212">
+
+    <TextView
+        android:id="@+id/txtSensor1"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Sensor 1: --"
+        android:textSize="18sp"
+        android:textColor="#FFFFFF"
+        android:layout_marginBottom="16dp"/>
+
+    <TextView
+        android:id="@+id/txtSensor2"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Sensor 2: --"
+        android:textSize="18sp"
+        android:textColor="#FFFFFF"
+        android:layout_marginBottom="16dp"/>
+
+    <TextView
+        android:id="@+id/txtSensor3"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Sensor 3: --"
+        android:textSize="18sp"
+        android:textColor="#FFFFFF"/>
+</LinearLayout>
