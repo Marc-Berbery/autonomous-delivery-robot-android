@@ -1,0 +1,1643 @@
+import RPi.GPIO as GPIO
+import time
+import paho.mqtt.client as mqtt
+import json
+import os
+import smbus  # For I2C communication with gyroscope
+import math   # For mathematical operations on gyroscope data
+import threading  # Add this import at the top of the file
+import smtplib
+import grovepi
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import random
+
+# Add these variables to the global section
+delivery_in_progress = False
+delivery_stop_flag = False
+obstacleDetected = False
+# Add IR sensor related variables
+IR_PIN = 25  # IR sensor connected to pin 25 (changed from 22 to match your test code)
+package_present = False  # Track if package is present
+package_present_at_start = False  # Track if package was present when delivery started
+package_dropped = False  # Track if package was dropped during delivery
+
+# Add these print statements at the beginning of the script
+print("Starting script...")
+print("Initializing...")
+# test
+last_calibration_time = 0
+CALIBRATION_INTERVAL = 600  # seconds (10 minutes)
+
+# Add this line to define SENSOR_TOPIC
+SENSOR_TOPIC = "/khanfar/sensors/ultrasonic"
+# Set up GPIO
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+BUZZER_PIN = 8  # D8 port on GrovePi
+# Motor driver pins
+# RIGHT motors controlled by IN1/IN2 via OUT1/OUT2
+ENA = 12  # PWM pin for OUT1/OUT2 (right motors)
+IN1 = 17  # Controls OUT1 (right motors forward)
+IN2 = 18  # Controls OUT2 (right motors backward)
+
+# LEFT motors controlled by IN3/IN4 via OUT3/OUT4
+ENB = 13  # PWM pin for OUT3/OUT4 (left motors)
+IN3 = 27  # Controls OUT3 (left motors forward)
+IN4 = 22  # Controls OUT4 (left motors backward)
+
+# Setup pins
+motor_pins = [ENA, IN1, IN2, ENB, IN3, IN4]
+for pin in motor_pins:
+    GPIO.setup(pin, GPIO.OUT)
+
+# Setup IR sensor pin - IMPORTANT: Use a different pin than IN4 since both are using pin 22
+# We've changed IR_PIN to 25 based on your test code
+GPIO.setup(IR_PIN, GPIO.IN)
+print(f"IR Sensor configured on pin {IR_PIN}")
+    
+# Set up PWM
+pwm_right = GPIO.PWM(ENA, 100)  # 100 Hz frequency for right motors
+pwm_left = GPIO.PWM(ENB, 100)   # 100 Hz frequency for left motors
+
+# Start PWM with 0% duty cycle
+pwm_right.start(0)
+pwm_left.start(0)
+
+# Default speed settings
+default_speed = 80  # Starting at 60% for good performance
+turbo_speed = 100    # Turbo speed at 95%
+current_speed = default_speed  # Track current speed setting
+
+# Current motor states
+right_motors_state = {"forward": GPIO.LOW, "backward": GPIO.LOW, "enabled": False}
+left_motors_state = {"forward": GPIO.LOW, "backward": GPIO.LOW, "enabled": False}
+
+# Active command
+active_command = None
+turbo_mode = False  # Track if turbo mode is active
+
+# Path recording variables
+recording = False
+instruction_set = []
+last_command = None
+last_command_time = None
+json_data = None
+
+# MQTT broker settings
+broker_address = "broker.hivemq.com"  # Public broker for testing
+broker_port = 1883
+
+# Gyroscope setup
+# I2C bus setup (usually bus 1 on Raspberry Pi 3)
+bus = smbus.SMBus(1)
+
+# gyrohw290 I2C address - this may need to be adjusted based on the actual device
+GYRO_ADDR = 0x68  # Default I2C address for many gyroscopes like MPU6050
+
+# gyrohw290 register addresses - these may need adjustment based on the actual device
+GYRO_REG_POWER = 0x6B     # Power management register
+GYRO_REG_GYRO_X = 0x43    # Register for gyroscope X-axis data
+GYRO_REG_GYRO_Y = 0x45    # Register for gyroscope Y-axis data
+GYRO_REG_GYRO_Z = 0x47    # Register for gyroscope Z-axis data
+
+# Gyroscope scale factor - adjust based on your gyroscope settings
+GYRO_SCALE = 131.0  # For ±250 degrees/second range (typical default)
+
+# Variables for gyroscope data
+gyro_x_offset = 0  # Calibration offset for X-axis
+gyro_y_offset = 0  # Calibration offset for Y-axis
+gyro_z_offset = 0  # Calibration offset for Z-axis
+
+# Variables for angle calculation
+current_angle = 0.0  # Current rotation angle around vertical axis (yaw)
+last_gyro_time = 0    # For calculating time delta
+steering_correction = 0  # Correction factor for straight-line movement
+
+# PID control parameters for straight-line correction
+KP = 0.5  # Proportional gain - adjust based on testing
+KI = 0.1  # Integral gain
+KD = 0.1  # Derivative gain
+integral = 0.0  # Integral term
+last_error = 0.0  # Last error for derivative term
+
+# Debug settings
+DEBUG_MODE = True  # Set to False to disable debug prints
+DEBUG_INTERVAL = 1.0  # Seconds between regular debug prints
+last_debug_time = 0  # Track when we last printed debug info
+
+# Define global client variable for MQTT
+mqtt_client = None
+
+FRONT_ULTRASONIC_PIN = 2  # D2 port on GrovePi
+LEFT_ULTRASONIC_PIN = 3   # D3 port on GrovePi
+RIGHT_ULTRASONIC_PIN = 4  # D4 port on GrovePi
+OBSTACLE_THRESHOLD = 20   # 20 cm threshold for obstacle detection
+ultrasonic_monitoring = False  # Flag to control ultrasonic monitoring
+
+def generate_otp():
+    """Generate a random 5-digit OTP for delivery verification."""
+    otp = random.randint(10000, 99999)
+    return str(otp)
+
+
+# Add this function to initialize ultrasonic sensors
+def init_ultrasonic_sensors():
+    """Initialize the ultrasonic sensors."""
+    try:
+        # Set ultrasonic sensor pins to INPUT mode
+        grovepi.pinMode(FRONT_ULTRASONIC_PIN, "INPUT")
+        grovepi.pinMode(LEFT_ULTRASONIC_PIN, "INPUT")
+        grovepi.pinMode(RIGHT_ULTRASONIC_PIN, "INPUT")
+        print(f"Ultrasonic sensors configured on ports D{FRONT_ULTRASONIC_PIN}, D{LEFT_ULTRASONIC_PIN}, D{RIGHT_ULTRASONIC_PIN}")
+    except Exception as e:
+        print(f"Error initializing ultrasonic sensors: {e}")
+
+# Add function to read ultrasonic sensor values
+def read_ultrasonic_distance(pin):
+    """Read distance from an ultrasonic sensor."""
+    try:
+        # Use grovepi's ultrasonicRead function
+        distance = grovepi.ultrasonicRead(pin)
+        return distance
+    except Exception as e:
+        print(f"Error reading ultrasonic sensor on pin D{pin}: {e}")
+        return 500  # Return a large value (500 cm) on error to avoid false positives
+
+# Add function to monitor ultrasonic sensors
+def monitor_ultrasonic_sensors():
+    """Background loop to monitor ultrasonic sensors for obstacles."""
+    global delivery_in_progress, delivery_stop_flag, mqtt_client, ultrasonic_monitoring
+    
+    print("Ultrasonic sensor monitoring thread started")
+    ultrasonic_monitoring = True
+    
+    try:
+        while True:  # Keep the thread running even when monitoring is paused
+            # Only actively check for obstacles when monitoring is enabled
+            if ultrasonic_monitoring and delivery_in_progress and not delivery_stop_flag:
+                # Read distances from all three sensors
+                front_dist = read_ultrasonic_distance(FRONT_ULTRASONIC_PIN)
+                left_dist = read_ultrasonic_distance(LEFT_ULTRASONIC_PIN)
+                right_dist = read_ultrasonic_distance(RIGHT_ULTRASONIC_PIN)
+                
+                # Check if any sensor detects an obstacle within threshold
+                obstacle_detected = (
+                    front_dist < OBSTACLE_THRESHOLD or 
+                    left_dist < OBSTACLE_THRESHOLD or 
+                    right_dist < OBSTACLE_THRESHOLD
+                )
+                
+                if obstacle_detected:
+                    # Create the sensor message
+                    sensor_msg = f"sensor;obstacle;front:{front_dist}cm;left:{left_dist}cm;right:{right_dist}cm"
+                    
+                    # Publish to sensor topic
+                    if mqtt_client:
+                        mqtt_client.publish(SENSOR_TOPIC, sensor_msg)
+                        print(f"Obstacle detected: {sensor_msg}")
+                        
+                        # Send the delivery abort message
+                        mqtt_client.publish("/khanfar/delivery", "delivery aborted due obstacle")
+                        print("Published delivery abort message")
+                    
+                    # Set the stop flag to interrupt the delivery
+                    delivery_stop_flag = True
+                    
+                    # Stop the motors
+                    stop()
+            
+            # Sleep to avoid excessive CPU usage and sensor readings
+            time.sleep(0.2)
+            
+    except Exception as e:
+        print(f"Error in ultrasonic sensor monitoring loop: {e}")
+    finally:
+        ultrasonic_monitoring = False
+        print("Ultrasonic sensor monitoring stopped")
+
+def init_buzzer():
+    """Initialize the buzzer."""
+    try:
+        grovepi.pinMode(BUZZER_PIN, "OUTPUT")
+        # Turn off buzzer initially
+        grovepi.digitalWrite(BUZZER_PIN, 0)
+        print(f"Buzzer configured on pin D{BUZZER_PIN}")
+    except Exception as e:
+        print(f"Error initializing buzzer: {e}")
+
+# Add buzzer utility functions
+def short_beep(duration=0.2, pause=0.1):
+    """Make a short beep sound."""
+    try:
+        grovepi.digitalWrite(BUZZER_PIN, 1)  # Turn buzzer ON
+        time.sleep(duration)  # Beep for specified duration
+        grovepi.digitalWrite(BUZZER_PIN, 0)  # Turn buzzer OFF
+        time.sleep(pause)  # Pause before next beep
+    except Exception as e:
+        print(f"Error in short_beep: {e}")
+
+def long_beep(duration=0.8, pause=0.1):
+    """Make a long beep sound."""
+    try:
+        grovepi.digitalWrite(BUZZER_PIN, 1)  # Turn buzzer ON
+        time.sleep(duration)  # Beep for specified duration
+        grovepi.digitalWrite(BUZZER_PIN, 0)  # Turn buzzer OFF
+        time.sleep(pause)  # Pause before next beep
+    except Exception as e:
+        print(f"Error in long_beep: {e}")
+
+def delivery_start_beep():
+    """2 short beeps for delivery start."""
+    for _ in range(2):
+        short_beep()
+    print("Delivery start beep sequence completed")
+
+def destination_arrival_beep():
+    """3 short beeps for arrival at destination."""
+    for _ in range(3):
+        short_beep()
+    print("Destination arrival beep sequence completed")
+
+def return_journey_beep():
+    """1 short + 1 long beep for return journey."""
+    short_beep()
+    long_beep()
+    print("Return journey beep sequence completed")
+
+def package_dropped_beep():
+    """2 long beeps for package dropped alert."""
+    for _ in range(2):
+        long_beep()
+    print("Package dropped beep sequence completed")
+
+def init_gyroscope():
+    """Initialize the gyroscope sensor."""
+    try:
+        # Wake up the gyroscope (clear sleep bit)
+        bus.write_byte_data(GYRO_ADDR, GYRO_REG_POWER, 0)
+        print("Gyroscope initialized successfully")
+        
+        # Perform calibration
+        calibrate_gyroscope()
+        
+        if DEBUG_MODE:
+            print("DEBUG MODE ACTIVE - Gyroscope data and corrections will be printed")
+        
+    except Exception as e:
+        print(f"Error initializing gyroscope: {e}")
+        print("Gyroscope functions will be disabled")
+
+def calibrate_gyroscope():
+    """Calibrate the gyroscope by calculating offsets."""
+    global gyro_x_offset, gyro_y_offset, gyro_z_offset
+    
+    print("Calibrating gyroscope... Keep the device still")
+    
+    # More samples for better calibration
+    samples = 300  # Increased from default
+    x_sum = 0
+    y_sum = 0
+    z_sum = 0
+    
+    # Collect samples
+    for _ in range(samples):
+        x, y, z = read_raw_gyro_data()
+        x_sum += x
+        y_sum += y
+        z_sum += z
+        time.sleep(0.01)  # Short delay between readings
+    
+    # Calculate average offsets
+    gyro_x_offset = x_sum / samples
+    gyro_y_offset = y_sum / samples
+    gyro_z_offset = z_sum / samples
+    
+    print(f"Gyroscope calibration complete. Offsets: X={gyro_x_offset}, Y={gyro_y_offset}, Z={gyro_z_offset}")
+
+
+def check_recalibration():
+    global last_calibration_time
+    current_time = time.time()
+    
+    # Check if it's time to recalibrate
+    if current_time - last_calibration_time > CALIBRATION_INTERVAL:
+        print("Performing periodic gyroscope recalibration...")
+        calibrate_gyroscope()
+        last_calibration_time = current_time
+
+        
+def read_raw_gyro_data():
+    """Read raw gyroscope data from the sensor."""
+    try:
+        # Read 2 bytes from each axis register and convert to signed 16-bit value
+        x = bus.read_word_data(GYRO_ADDR, GYRO_REG_GYRO_X)
+        y = bus.read_word_data(GYRO_ADDR, GYRO_REG_GYRO_Y)
+        z = bus.read_word_data(GYRO_ADDR, GYRO_REG_GYRO_Z)
+        
+        # Convert from big-endian to little-endian and handle sign
+        x = ((x & 0xFF) << 8) | ((x >> 8) & 0xFF)
+        y = ((y & 0xFF) << 8) | ((y >> 8) & 0xFF)
+        z = ((z & 0xFF) << 8) | ((z >> 8) & 0xFF)
+        
+        # Convert to signed values
+        if x > 32767:
+            x -= 65536
+        if y > 32767:
+            y -= 65536
+        if z > 32767:
+            z -= 65536
+            
+        return x, y, z
+        
+    except Exception as e:
+        print(f"Error reading gyroscope data: {e}")
+        return 0, 0, 0
+
+def get_gyro_data():
+    """Get calibrated gyroscope data in degrees per second."""
+    x, y, z = read_raw_gyro_data()
+    
+    # Apply calibration offsets
+    x = (x - gyro_x_offset) / GYRO_SCALE
+    y = (y - gyro_y_offset) / GYRO_SCALE
+    z = (z - gyro_z_offset) / GYRO_SCALE
+    
+    if DEBUG_MODE:
+        current_time = time.time()
+        global last_debug_time
+        if current_time - last_debug_time >= DEBUG_INTERVAL:
+            print(f"GYRO DATA - X: {x:.2f}°/s, Y: {y:.2f}°/s, Z: {z:.2f}°/s, Angle: {current_angle:.2f}°")
+            last_debug_time = current_time
+    
+    return x, y, z
+
+def update_angle():
+    """Update the current angle based on gyroscope data with better drift handling."""
+    global current_angle, last_gyro_time
+    
+    current_time = time.time()
+    
+    # Skip if this is the first update
+    if last_gyro_time == 0:
+        last_gyro_time = current_time
+        return 0
+    
+    # Calculate time delta in seconds
+    dt = current_time - last_gyro_time
+    last_gyro_time = current_time
+    
+    # Read gyroscope data (degrees per second)
+    _, _, z = get_gyro_data()  # We only need z-axis for yaw (rotation in horizontal plane)
+    
+    # Apply a more aggressive threshold filter to deal with inconsistent drift
+    # This ignores small rotational values that are likely just noise or drift
+    DRIFT_THRESHOLD = 0.3  # Adjust this value based on testing
+    if abs(z) < DRIFT_THRESHOLD:
+        z = 0.0  # Zero out small values
+    
+    # Update angle by integrating gyro rate over time
+    angle_change = z * dt
+    current_angle += angle_change
+    
+    # Normalize to -180 to +180 degrees
+    if current_angle > 180:
+        current_angle -= 360
+    elif current_angle < -180:
+        current_angle += 360
+        
+    return angle_change
+
+def reset_angle():
+    """Reset the current angle to zero."""
+    global current_angle, integral, last_error
+    current_angle = 0.0
+    integral = 0.0
+    last_error = 0.0
+    
+    if DEBUG_MODE:
+        print("ANGLE RESET - Gyroscope angle reset to zero")
+
+def calculate_steering_correction():
+    """Calculate steering correction using PID control with improved parameters for high speeds."""
+    global integral, last_error, steering_correction, current_speed, KP, KI, KD
+    
+    # Current error is the current angle (should be 0 for straight line)
+    error = current_angle
+    
+    # Adjust PID parameters for high speed operation (turbo mode)
+    # In high speeds, we need more responsive correction
+    original_KP, original_KI, original_KD = KP, KI, KD
+    
+    if current_speed >= 95:  # Turbo or near-turbo speed
+        # More aggressive P and D values for faster response at high speed
+        KP = 0.9  # Higher P gain for faster response (was 0.5)
+        KI = 0.08 # Lower I gain to reduce oscillation (was 0.1)
+        KD = 0.3  # Higher D gain for faster response to changes (was 0.1)
+    
+    # Calculate integral term with anti-windup
+    integral += error
+    integral = max(-40, min(40, integral))  # Limit integral to prevent excessive buildup
+    
+    # Calculate derivative term
+    derivative = error - last_error
+    last_error = error
+    
+    # PID formula
+    steering_correction = KP * error + KI * integral + KD * derivative
+    
+    # Limit correction to reasonable values
+    steering_correction = max(-40, min(40, steering_correction))
+    
+    # Debug info but only for significant corrections
+    if DEBUG_MODE and abs(error) > 1.0:
+        print(f"PID CALCULATION - Error: {error:.2f}°, P: {KP * error:.2f}, " 
+              f"I: {KI * integral:.2f}, D: {KD * derivative:.2f}, " 
+              f"Correction: {steering_correction:.2f} {'[TURBO]' if current_speed >= 95 else ''}")
+    
+    # Restore original PID values
+    KP, KI, KD = original_KP, original_KI, original_KD
+    
+    return steering_correction
+
+# Add IR sensor function to check package presence
+def check_package_presence():
+    """Check if a package is present using IR sensor."""
+    global package_present, package_dropped, mqtt_client
+    
+    try:
+        # IR sensor reading (typical IR sensors output LOW when object is detected)
+        # Adjust logic based on your specific sensor behavior from the test code
+        current_state = GPIO.input(IR_PIN)
+        
+        # Using the logic from your test code
+        package_detected = not current_state  # Invert if your sensor logic is different
+        
+        # Update package state and publish only when there's a change
+        if package_present != package_detected:
+            package_present = package_detected
+            
+            # Publish status to MQTT topic if client is available
+            if mqtt_client:
+                status = "package_present" if package_detected else "no_package"
+                mqtt_client.publish("/khanfar/IR", status)
+                print(f"IR Sensor: {status}")
+            
+        return package_detected
+        
+    except Exception as e:
+        print(f"Error reading IR sensor: {e}")
+        return False
+
+# Add package monitoring function
+def monitor_package():
+    """Background loop to monitor package presence."""
+    global package_present, package_dropped, delivery_in_progress, mqtt_client
+    
+    try:
+        print("Package monitoring thread started")
+        while True:
+            # Check package presence
+            is_present = check_package_presence()
+            
+            # If delivery is in progress, check for package drop
+            if delivery_in_progress and package_present_at_start:
+                if not is_present and not package_dropped:
+                    # Package was present at start but now it's not - it was dropped
+                    package_dropped = True
+                    if mqtt_client:
+                        mqtt_client.publish("/khanfar/IR", "package_dropped")
+                    print("ALERT: Package has been dropped during delivery!")
+                    # Add package dropped beep
+                    package_dropped_beep()
+            
+            # Short sleep to avoid hogging CPU
+            time.sleep(0.2)
+            
+    except Exception as e:
+        print(f"Error in package monitoring loop: {e}")
+
+# Motor control functions
+def stop():
+    """Stop all motors."""
+    global right_motors_state, left_motors_state, active_command
+    
+    # Stop right motors
+    GPIO.output(IN1, GPIO.LOW)
+    GPIO.output(IN2, GPIO.LOW)
+    pwm_right.ChangeDutyCycle(0)
+    
+    # Stop left motors
+    GPIO.output(IN3, GPIO.LOW)
+    GPIO.output(IN4, GPIO.LOW)
+    pwm_left.ChangeDutyCycle(0)
+    
+    # Update states
+    right_motors_state = {"forward": GPIO.LOW, "backward": GPIO.LOW, "enabled": False}
+    left_motors_state = {"forward": GPIO.LOW, "backward": GPIO.LOW, "enabled": False}
+    active_command = "Stop"
+    reset_angle()
+
+    print("Command executed: Stop")
+
+def forward(speed=None, is_return_journey=False):
+    """Move forward with gyroscope-based straight-line correction and turbo mode handling."""
+    global right_motors_state, left_motors_state, active_command, KP, KI, KD
+    
+    if speed is None:
+        speed = current_speed
+    
+    # Store original PID values if this is a return journey
+    original_KP, original_KI, original_KD = None, None, None
+    if is_return_journey:
+        # Save original values
+        original_KP, original_KI, original_KD = KP, KI, KD
+        
+        # Apply more aggressive correction during return journeys
+        KP = 0.8  # Increase proportional gain
+        KI = 0.15 # Integral gain
+        KD = 0.2  # Increase derivative gain
+        print("Using enhanced PID values for return journey forward movement")
+    
+    # Reset angle tracking when starting forward movement
+    reset_angle()
+    
+    # MODIFIED: Switched pin settings to match mobile app expectations
+    # Right motors backward
+    GPIO.output(IN1, GPIO.LOW)
+    GPIO.output(IN2, GPIO.HIGH)
+    # Left motors backward
+    GPIO.output(IN3, GPIO.LOW)
+    GPIO.output(IN4, GPIO.HIGH)
+    
+    # Special handling for turbo mode (maximum speed)
+    if speed >= 95:
+        # In turbo mode, start with a slight right compensation 
+        # to counteract common right drift at high speeds
+        right_speed = speed
+        left_speed = speed - 3  # Apply a small initial adjustment to left motor
+        print(f"Applying slight right drift compensation for turbo mode")
+    else:
+        # Normal mode - start with equal speeds
+        right_speed = speed
+        left_speed = speed
+    
+    # Apply the speeds
+    pwm_right.ChangeDutyCycle(right_speed)
+    pwm_left.ChangeDutyCycle(left_speed)
+    
+    # Update states
+    right_motors_state = {"forward": GPIO.HIGH, "backward": GPIO.LOW, "enabled": True}
+    left_motors_state = {"forward": GPIO.HIGH, "backward": GPIO.LOW, "enabled": True}
+    active_command = "Forward"
+    
+    print(f"Command executed: Forward (Speed: R={right_speed}%, L={left_speed}%){' [Return journey mode]' if is_return_journey else ''}")
+
+def backward(speed=None):
+    """Move backward with gyroscope-based straight-line correction."""
+    global right_motors_state, left_motors_state, active_command
+    
+    if speed is None:
+        speed = current_speed
+    
+    # Reset angle tracking when starting backward movement
+    reset_angle()
+    
+    # MODIFIED: Switched pin settings to match mobile app expectations
+    # Right motors forward
+    GPIO.output(IN1, GPIO.HIGH)
+    GPIO.output(IN2, GPIO.LOW)
+    # Left motors forward
+    GPIO.output(IN3, GPIO.HIGH)
+    GPIO.output(IN4, GPIO.LOW)
+    
+    # Reduce the fixed correction to prevent left drift
+    # Now using a more conservative 5% adjustment instead of 8%
+    right_speed = speed
+    left_speed = speed
+    
+    if speed >= 100:
+        # In turbo mode: Reduce right motor power slightly
+        right_speed = max(75, speed - 5)  # Reduce right motor by only 5%, keep minimum 75%
+        left_speed = speed
+    else:
+        # In normal mode: Apply a smaller boost to left motor
+        right_speed = speed
+        left_speed = min(100, speed + 5)  # Add just 5% to left motor, capped at 100
+    
+    # Apply the adjusted speeds
+    pwm_right.ChangeDutyCycle(right_speed)
+    pwm_left.ChangeDutyCycle(left_speed)
+    
+    # Update states
+    right_motors_state = {"forward": GPIO.LOW, "backward": GPIO.HIGH, "enabled": True}
+    left_motors_state = {"forward": GPIO.LOW, "backward": GPIO.HIGH, "enabled": True}
+    active_command = "Backward"
+    print(f"Command executed: Backward (Right: {right_speed}%, Left: {left_speed}%)")
+
+def turn_right(speed=None):
+    """Rotate right in place - left wheels forward, right wheels backward."""
+    global right_motors_state, left_motors_state, active_command
+    
+    if speed is None:
+        speed = current_speed
+    
+    # Reset angle measurement before turning
+    reset_angle()
+    
+    # Right motors backward
+    GPIO.output(IN1, GPIO.LOW)
+    GPIO.output(IN2, GPIO.HIGH)
+    pwm_right.ChangeDutyCycle(speed)
+    
+    # Left motors forward
+    GPIO.output(IN3, GPIO.HIGH)
+    GPIO.output(IN4, GPIO.LOW)
+    pwm_left.ChangeDutyCycle(speed)
+    
+    # Update states
+    right_motors_state = {"forward": GPIO.LOW, "backward": GPIO.HIGH, "enabled": True}
+    left_motors_state = {"forward": GPIO.HIGH, "backward": GPIO.LOW, "enabled": True}
+    active_command = "Turn Right"
+    print(f"Command executed: Turn Right (Speed: {speed}%)")
+
+def turn_left(speed=None):
+    """Rotate left in place - left wheels backward, right wheels forward."""
+    global right_motors_state, left_motors_state, active_command
+    
+    if speed is None:
+        speed = current_speed
+    
+    # Reset angle measurement before turning
+    reset_angle()
+    
+    # Right motors forward
+    GPIO.output(IN1, GPIO.HIGH)
+    GPIO.output(IN2, GPIO.LOW)
+    pwm_right.ChangeDutyCycle(speed)
+    
+    # Left motors backward
+    GPIO.output(IN3, GPIO.LOW)
+    GPIO.output(IN4, GPIO.HIGH)
+    pwm_left.ChangeDutyCycle(speed)
+    
+    # Update states
+    right_motors_state = {"forward": GPIO.HIGH, "backward": GPIO.LOW, "enabled": True}
+    left_motors_state = {"forward": GPIO.LOW, "backward": GPIO.HIGH, "enabled": True}
+    active_command = "Turn Left"
+    print(f"Command executed: Turn Left (Speed: {speed}%)")
+
+def adjust_straight_line():
+    """Apply gyroscope-based correction for straight-line movement with special handling for turbo mode."""
+    global active_command, current_speed, turbo_mode
+    
+    if active_command not in ["Forward", "Backward"]:
+        return
+    
+    # Update the current angle
+    update_angle()
+    
+    # Calculate steering correction
+    correction = calculate_steering_correction()
+    
+    # Base speed is current_speed
+    base_speed = current_speed
+    
+    # Determine if we're in turbo mode (at or near max speed)
+    is_max_speed = (base_speed >= 95)
+    
+    # Different correction parameters based on direction
+    correction_threshold = 0.4  # Default threshold
+    
+    if active_command == "Backward":
+        # More sensitive correction for backward
+        correction_threshold = 0.3
+        
+        # Apply drift compensation to the correction value
+        if abs(current_angle) < 0.8:  # Small drift, don't correct
+            return
+    
+    # Only apply corrections if they're significant enough
+    if abs(correction) > correction_threshold:
+        # For turbo mode or near-max speed, we can only reduce speed on one side
+        if is_max_speed:
+            # More aggressive reduction for higher angle deviation
+            reduction_factor = min(40, abs(correction) * 4.0)  # Scale with angle, max 40% reduction
+            
+            if correction > 0:  # Drifting right, need to turn left
+                # Keep right at max, reduce left
+                right_speed = base_speed
+                left_speed = max(60, base_speed - reduction_factor)
+            else:  # Drifting left, need to turn right
+                # Reduce right, keep left at max
+                right_speed = max(60, base_speed - reduction_factor)
+                left_speed = base_speed
+        else:
+            # Not in turbo mode, use the balanced approach
+            correction_multiplier = 1.8
+            
+            if active_command == "Backward":
+                correction *= 0.75  # Reduce correction strength for backward
+            
+            if correction > 0:  # Drifting right, need to turn left
+                right_boost = min(100 - base_speed, abs(correction) * correction_multiplier * 0.25)
+                right_speed = base_speed + right_boost
+                left_speed = max(65, base_speed - abs(correction) * correction_multiplier * 0.25)
+            else:  # Drifting left, need to turn right
+                left_boost = min(100 - base_speed, abs(correction) * correction_multiplier * 0.25)
+                right_speed = max(65, base_speed - abs(correction) * correction_multiplier * 0.25)
+                left_speed = base_speed + left_boost
+        
+        # Apply speeds
+        pwm_right.ChangeDutyCycle(right_speed)
+        pwm_left.ChangeDutyCycle(left_speed)
+        
+        if DEBUG_MODE:
+            print(f"CORRECTION - Direction: {active_command}, Angle: {current_angle:.2f}°, "
+                  f"Speeds: R={right_speed:.1f}%, L={left_speed:.1f}% {'[TURBO]' if is_max_speed else ''}")
+    elif DEBUG_MODE and abs(correction) > 0.1:
+        print(f"MINOR CORRECTION NEEDED (not applied) - Angle: {current_angle:.2f}°, Correction: {correction:.2f}")
+
+def set_turbo_mode(enabled):
+    """Enable or disable turbo mode and update speed if currently moving."""
+    global turbo_mode, current_speed, active_command
+    
+    # Update turbo mode state
+    turbo_mode = enabled
+    
+    # Set the appropriate speed
+    if enabled:
+        current_speed = turbo_speed
+        print(f"Turbo mode ON (Speed: {turbo_speed}%)")
+    else:
+        current_speed = default_speed
+        print(f"Turbo mode OFF (Speed: {default_speed}%)")
+    
+    # Update the running motors if any command is active
+    if active_command:
+        update_active_command_speed()
+
+def update_active_command_speed():
+    """Update the speed of the currently active command."""
+    if active_command == "Forward":
+        forward(current_speed)
+    elif active_command == "Backward":
+        backward(current_speed)
+    elif active_command == "Turn Right":
+        turn_right(current_speed)
+    elif active_command == "Turn Left":
+        turn_left(current_speed)
+    # If active_command is Stop, no need to update speed
+
+# Path recording functions
+is_calibrating = False
+
+def handle_path_recording(client, command):
+    """Handle path recording logic."""
+    global recording, instruction_set, last_command, last_command_time, json_data, current_angle, is_calibrating
+    
+    current_time = time.time()
+    
+    if command == "start":
+        recording = True
+        is_calibrating = True  # Set calibrating flag
+        instruction_set = []
+        last_command = None
+        last_command_time = None
+        
+        # Ensure motors are stopped
+        stop()
+        
+        # Brief pause to ensure complete stop
+        time.sleep(0.5)
+        
+        # Publish calibration start message to MQTT
+        client.publish("/khanfar/status", "calibration_started")
+        
+        # Full recalibration for recording
+        print("Performing full gyroscope calibration before recording")
+        calibrate_gyroscope()
+        
+        # Reset angle after calibration
+        reset_angle()
+        
+        # Calibration complete
+        is_calibrating = False
+        
+        # Publish calibration complete message to MQTT
+        client.publish("/khanfar/status", "calibration_complete")
+        
+        print("Started recording path with fresh gyroscope calibration")
+
+    
+    elif command == "end" and recording:
+        recording = False
+        
+        # If there's an active last command, finalize its duration before ending
+        if last_command is not None and last_command != "stop":
+            duration = current_time - last_command_time
+            for cmd in reversed(instruction_set):
+                if cmd["command"] == last_command:
+                    cmd["duration"] = round(duration, 3)
+                    break
+        
+        # Apply timing compensation to account for motor physics and system delays
+        for cmd in instruction_set:
+            # Add a fixed delay compensation (adjust based on testing)
+            fixed_delay = 0.2  # 200ms fixed system delay compensation
+            
+            # Add proportional compensation based on command type
+            # Different commands may need different compensation factors
+            if cmd["command"] == "forward" or cmd["command"] == "backward":
+                # Forward/backward movements might need more compensation due to inertia
+                cmd["duration"] = cmd["duration"]
+            elif cmd["command"] == "right" or cmd["command"] == "left":
+                # Turns may need different compensation
+                cmd["duration"] = cmd["duration"] 
+            
+            # Round to 3 decimal places for consistency
+            cmd["duration"] = round(cmd["duration"], 3)
+        
+        # Create and publish JSON
+        json_data = {"instruction_set": instruction_set}
+        json_str = json.dumps(json_data)
+        client.publish("/khanfar/json", json_str)
+        print(f"Published JSON with timing compensation: {json_str}")
+    
+    elif recording:
+        # If this is not the first command (we have a last command)
+        if last_command is not None:
+            # Always update duration for any previous movement command
+            if last_command != "stop":
+                duration = current_time - last_command_time
+                # Find the last command in instruction_set and update its duration
+                for cmd in reversed(instruction_set):
+                    if cmd["command"] == last_command:
+                        cmd["duration"] = round(duration, 3)
+                        break
+        
+        # Add the new command to instruction_set if it's not "stop"
+        if command != "stop":
+            # For turn commands, record the gyroscope angle data
+            if command == "right" or command == "left":
+                instruction_set.append({
+                    "command": command,
+                    "duration": 0.0,
+                    "angle": 0.0  # Initialize angle, will be updated when turn completes
+                })
+            else:
+                instruction_set.append({
+                    "command": command,
+                    "duration": 0.0
+                })
+        
+        # Update last command info regardless of command type
+        last_command = command
+        last_command_time = current_time
+
+# Email configuration
+EMAIL_SERVER = "smtp.gmail.com"
+EMAIL_PORT = 587
+EMAIL_ADDRESS = "autonomous.delivery.robot.1@gmail.com"  # Replace with your robot's email address
+EMAIL_PASSWORD = "your-app-password"          # Use an app password for Gmail
+
+def send_delivery_notification(recipient_email, otp):
+    """Send delivery notification email with OTP to the recipient."""
+    try:
+        # Create message
+        message = MIMEMultipart()
+        message["From"] = EMAIL_ADDRESS
+        message["To"] = recipient_email
+        message["Subject"] = "Order Arrived"  # Changed subject as requested
+        
+        # Email body with OTP
+        body = "Order arrived, please pick up the item.\nOTP: " + otp
+        message.attach(MIMEText(body, "plain"))
+        
+        # Connect to server and send
+        server = smtplib.SMTP(EMAIL_SERVER, EMAIL_PORT)
+        server.starttls()  # Secure the connection
+        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        
+        # Send email
+        server.send_message(message)
+        server.quit()
+        
+        print(f"Delivery notification email with OTP sent to {recipient_email}")
+        return True
+    except Exception as e:
+        print(f"Failed to send email notification: {e}")
+        return False
+
+def parse_delivery_message(payload):
+    """Parse the delivery message in format 'email;jsonstring'."""
+    # Special case for "delivered" message
+    if payload == "delivered":
+        print("Received delivery completion message")
+        return "RETURN_SIGNAL", None
+    
+    try:
+        # Split by the first semicolon
+        parts = payload.split(';', 1)
+        if len(parts) != 2:
+            raise ValueError("Invalid message format. Expected 'email;jsonstring'")
+            
+        email = parts[0].strip()
+        json_str = parts[1].strip()
+        
+        # Validate email format (basic check)
+        if '@' not in email or '.' not in email:
+            raise ValueError(f"Invalid email address format: {email}")
+            
+        # Parse the JSON
+        instruction_data = json.loads(json_str)
+        
+        return email, instruction_data
+    except json.JSONDecodeError:
+        print("Error: Invalid JSON format in instruction set")
+        return None, None
+    except Exception as e:
+        print(f"Error parsing delivery message: {e}")
+        return None, None
+
+# MQTT callback functions
+def on_connect(client, userdata, flags, rc):
+    """Called when the client connects to the broker"""
+    if rc == 0:
+        print(f"Connected to MQTT broker at {broker_address}:{broker_port}")
+        # Subscribe to topics
+        client.subscribe("/khanfar/control")
+        client.subscribe("/khanfar/delivery")
+        client.subscribe(SENSOR_TOPIC)
+        client.subscribe("/khanfar/otp")  # Add this line
+
+        print("Subscribed to /khanfar/control, /khanfar/delivery, and sensor topics")
+    else:
+        print(f"Connection failed with error code {rc}")
+
+def on_message(client, userdata, msg):
+    """Called when a message is received from the broker"""
+    global delivery_stop_flag, delivery_in_progress, obstacleDetected, last_delivery_instructions
+    
+    topic = msg.topic
+    payload = msg.payload.decode("utf-8").strip()
+    
+    # Don't print large payloads (like JSON instruction sets)
+    if len(payload) > 50:
+        print(f"Message received on topic {topic}: {payload[:50]}...")  # Print first 50 chars of payload
+    else:
+        print(f"Message received on topic {topic}: {payload}")
+    
+    if topic == SENSOR_TOPIC:
+        # Process sensor data
+        if "sensor" in payload and "cm" in payload:
+            print(f"Obstacle detected: {payload}")
+            obstacleDetected = True
+            
+            # Set delivery stop flag if a delivery is in progress
+            if delivery_in_progress:
+                delivery_stop_flag = True
+                print("Delivery stopped due to obstacle detection")
+            
+            # Send stop signal
+            stop()
+        else:
+            obstacleDetected = False
+    
+    elif topic == "/khanfar/control":
+        # Same control logic as before...
+        payload_lower = payload.lower()
+        is_movement_command = payload_lower in ["forward", "backward", "right", "left"]
+        
+        if is_calibrating and is_movement_command:
+            # If calibrating, don't process movement commands, but notify the user
+            print(f"Ignoring command '{payload}' - calibration in progress")
+            client.publish("/khanfar/status", "command_ignored_calibrating")
+            return
+        
+        # Process movement commands
+        if payload_lower == "forward":
+            forward()
+        elif payload_lower == "backward":
+            backward()
+        elif payload_lower == "right":
+            turn_right()
+        elif payload_lower == "left":
+            turn_left()
+        elif payload_lower == "stop":
+            stop()
+            # If a delivery is in progress, set the stop flag
+            if delivery_in_progress:
+                delivery_stop_flag = True
+                print("Delivery manually stopped")
+        elif payload_lower == "turbo on":
+            set_turbo_mode(True)
+        elif payload_lower == "turbo off":
+            set_turbo_mode(False)
+            
+        # Handle path recording
+        if payload_lower in ["start", "end", "forward", "backward", "right", "left", "stop"]:
+            handle_path_recording(client, payload_lower)
+        
+    elif topic == "/khanfar/delivery":
+        # Parse the message to check if it's a delivery or special command
+        result, instruction_data = parse_delivery_message(payload)
+        
+        # Handle "delivered" message - start return journey
+        if result == "RETURN_SIGNAL":
+            if delivery_in_progress:
+                print("Cannot start return journey - delivery already in progress")
+                return
+                
+            if last_delivery_instructions is None:
+                print("No previous delivery instructions found for return journey")
+                return
+                
+            print("Starting return journey in 10 seconds...")
+            
+            # Define a thread function to handle the waiting and return journey
+            def return_journey_thread():
+                # Wait 10 seconds
+                time.sleep(10)
+                
+                # Create return instructions
+                return_instructions = create_return_instructions(last_delivery_instructions)
+                return_instruction_set = {'instruction_set': return_instructions}
+                
+                print("Now executing return journey...")
+                execute_return_journey(return_instruction_set, client)
+            
+            # Start the delayed return journey in a separate thread
+            return_thread = threading.Thread(target=return_journey_thread)
+            return_thread.daemon = True
+            return_thread.start()
+            return
+            
+        # Regular delivery instruction
+        if delivery_in_progress:
+            print("Ignoring new delivery request: delivery already in progress")
+            return
+            
+        if result is None or instruction_data is None:
+            print("Failed to parse delivery message")
+            return
+            
+        # Store the instruction set for potential return journey (if it's an email)
+        if result != "RETURN_SIGNAL" and 'instruction_set' in instruction_data:
+            last_delivery_instructions = instruction_data['instruction_set']
+            
+        print(f"Received delivery instructions for: {result}")
+        
+        # Start delivery in a new thread so it doesn't block MQTT callbacks
+        delivery_thread = threading.Thread(
+            target=execute_instruction_set,
+            args=(instruction_data, result if result != "RETURN_SIGNAL" else None)
+        )
+        delivery_thread.daemon = True
+        delivery_thread.start()
+
+def on_disconnect(client, userdata, rc):
+    """Called when the client disconnects from the broker"""
+    if rc != 0:
+        print(f"Unexpected disconnection. Reconnecting...")
+        try_reconnect(client)
+
+def try_reconnect(client):
+    """Attempts to reconnect to the broker"""
+    print("Attempting to reconnect...")
+    try:
+        client.reconnect()
+    except:
+        print("Reconnection failed. Will retry in 5 seconds...")
+        time.sleep(5)
+        try_reconnect(client)
+
+# Function to update gyroscope readings and make adjustments
+def gyroscope_update_loop(client):
+    """Background loop to update gyroscope readings and adjust motors."""
+    global current_angle, active_command, recording, instruction_set, last_calibration_time
+    
+    # Initialize the last calibration time when the thread starts
+    last_calibration_time = time.time()
+    
+    try:
+        while True:
+            # Check if it's time for periodic recalibration
+            current_time = time.time()
+            if current_time - last_calibration_time > CALIBRATION_INTERVAL:
+                print("Performing periodic gyroscope recalibration...")
+                # Only recalibrate if the robot is not actively moving
+                if active_command == "Stop" or active_command is None:
+                    calibrate_gyroscope()
+                    last_calibration_time = current_time
+                else:
+                    print("Skipping recalibration because robot is moving")
+            
+            # Update angle from gyroscope
+            angle_change = update_angle()
+            
+            # Apply straight-line correction if moving forward or backward
+            if active_command in ["Forward", "Backward"]:
+                adjust_straight_line()
+            
+            # If recording and turning, update the angle in the instruction set
+            if recording and active_command in ["Turn Right", "Turn Left"]:
+                # Find the current turn command in the instruction set
+                for cmd in reversed(instruction_set):
+                    if cmd["command"].lower() == active_command.lower().replace("turn ", ""):
+                        # Update the recorded angle
+                        current_turn_angle = abs(current_angle)
+                        cmd["angle"] = current_turn_angle
+                        
+                        if DEBUG_MODE and current_turn_angle > 5:  # Only show significant turning
+                            print(f"TURN RECORDING - {active_command}: Current angle = {current_turn_angle:.2f}°")
+                        break
+            
+            # Short sleep to avoid hogging CPU
+            time.sleep(0.05)
+    
+    except Exception as e:
+        print(f"Error in gyroscope update loop: {e}")
+
+# Modified execute_instruction_set function to include package monitoring
+def execute_instruction_set(instruction_set, recipient_email=None):
+    """Execute instructions from a JSON instruction set and notify recipient."""
+    global delivery_in_progress, delivery_stop_flag, active_command, current_speed
+    global package_present, package_present_at_start, package_dropped, mqtt_client
+    
+    try:
+        # Store the original speed
+        original_speed = current_speed
+        
+        # Parse the instruction set
+        instructions = instruction_set.get('instruction_set', [])
+        
+        # Set delivery flag and force 100% speed for deliveries
+        delivery_in_progress = True
+        delivery_stop_flag = False
+        package_dropped = False
+        current_speed = 100
+        
+        # Check if package is present at start
+        package_present_at_start = check_package_presence()
+        if not package_present_at_start:
+            print("WARNING: No package detected at start of delivery!")
+            if mqtt_client:
+                mqtt_client.publish("/khanfar/IR", "delivery_started_no_package")
+        else:
+            print("Package detected at start of delivery")
+            if mqtt_client:
+                mqtt_client.publish("/khanfar/IR", "delivery_started_with_package")
+        
+        # Add the delivery start beep here
+        delivery_start_beep()
+        if not instructions:
+            print("No instructions found in the delivery instruction set.")
+            return
+        
+        print(f"Starting delivery with {len(instructions)} instructions (Speed: 100%)")
+        if recipient_email:
+            print(f"Will notify {recipient_email} upon completion")
+            
+        stop()
+        
+        # Reset angle before starting delivery
+        reset_angle()
+        
+        # Execute each command
+        for idx, instruction in enumerate(instructions):
+            # Check if delivery was canceled
+            if delivery_stop_flag:
+                print("Delivery stopped by obstacle or manual override")
+                break
+            
+            # Check if package was dropped during previous instruction
+            if package_dropped and package_present_at_start:
+                print("Delivery paused - package has been dropped")
+                stop()
+                
+                # Wait to see if package is placed back
+                waiting_time = 0
+                max_wait_time = 30  # Wait up to 30 seconds for package to be returned
+                print(f"Waiting for package to be placed back (max {max_wait_time} seconds)...")
+                
+                while waiting_time < max_wait_time:
+                    if check_package_presence():
+                        print("Package detected again - resuming delivery")
+                        package_dropped = False
+                        if mqtt_client:
+                            mqtt_client.publish("/khanfar/IR", "package_returned")
+                        break
+                    time.sleep(1)
+                    waiting_time += 1
+                
+                # If package not returned after waiting, stop delivery
+                if package_dropped:
+                    print("Package not returned - aborting delivery")
+                    if mqtt_client:
+                        mqtt_client.publish("/khanfar/IR", "delivery_aborted_package_lost")
+                    break
+                
+            command = instruction.get('command', '').lower()
+            duration = float(instruction.get('duration', 0))
+            
+            print(f"\nExecuting delivery step {idx+1}/{len(instructions)}: {command} for {duration} seconds")
+            
+            # Execute the appropriate command
+            if command == 'forward':
+                forward()
+            elif command == 'backward':
+                backward()
+            elif command == 'right':
+                turn_right()
+            elif command == 'left':
+                turn_left()
+            elif command == 'stop':
+                stop()
+            else:
+                print(f"Unknown command: {command}")
+                continue
+            
+            # Wait for the specified duration, checking for obstacles and package every 0.1 seconds
+            elapsed = 0
+            while elapsed < duration and not delivery_stop_flag:
+                time.sleep(0.1)
+                elapsed += 0.1
+                
+                # If package was present at start but is now gone, mark as dropped
+                # We don't break immediately - will finish current instruction first
+                if package_present_at_start and not package_dropped and not check_package_presence():
+                    package_dropped = True
+                    if mqtt_client:
+                        mqtt_client.publish("/khanfar/IR", "package_dropped_during_movement")
+                    print("Package drop detected - will stop after current instruction")
+                
+            # If we didn't complete the duration due to a stop flag, break the loop
+            if delivery_stop_flag:
+                # Add this condition to check if it was due to an obstacle
+                if obstacleDetected:
+                    print("Delivery stopped due to obstacle detection")
+                # The ultrasonic monitoring thread will have already published the abort message
+                else:
+                    print("Delivery stopped by manual override")
+
+                print("Delivery interrupted")
+                break
+        
+        # Stop motors after completing all instructions
+        stop()
+        
+        # Only beep and send notification if delivery wasn't interrupted and package wasn't lost
+        if not delivery_stop_flag and not package_dropped:
+            # Add the destination arrival beep here
+            destination_arrival_beep()
+    
+            if recipient_email:
+    # Generate OTP for this delivery
+                otp = generate_otp()
+                print(f"Generated OTP for delivery: {otp}")
+    
+    # Publish OTP to MQTT topic
+                if mqtt_client:
+                    mqtt_client.publish("/khanfar/otp", otp)
+                    print(f"Published OTP to MQTT topic: /khanfar/otp")
+    
+    # Send email with OTP
+                print(f"Sending delivery notification to {recipient_email} with OTP")
+                send_delivery_notification(recipient_email, otp)
+        
+        print("\nDelivery completed!")
+        
+    except Exception as e:
+        print(f"Error executing delivery: {str(e)}")
+    finally:
+        # Reset delivery flags
+        delivery_in_progress = False
+        delivery_stop_flag = False
+        package_dropped = False
+        
+        # Reset speed to original
+        current_speed = original_speed
+
+last_delivery_instructions = None
+
+def create_return_instructions(original_instructions):
+    """Create a return instruction set by reversing and flipping directions."""
+    # Start with an empty instruction set
+    return_instructions = []
+    
+    # Reverse the original instructions and flip directions
+    for instruction in reversed(original_instructions):
+        command = instruction.get('command', '').lower()
+        duration = float(instruction.get('duration', 0))
+        
+        # Create a new instruction with flipped direction if needed
+        if command == 'forward':
+            new_command = 'forward'  # Keep forward as forward for simplicity
+        elif command == 'backward':
+            new_command = 'backward'  # Keep backward as backward
+        elif command == 'right':
+            new_command = 'left'  # Flip right to left
+        elif command == 'left':
+            new_command = 'right'  # Flip left to right
+        elif command == 'stop':
+            new_command = 'stop'  # Keep stop as stop
+        else:
+            # Skip unknown commands
+            continue
+            
+        # Add the reversed instruction
+        return_instructions.append({
+            "command": new_command,
+            "duration": duration
+        })
+    
+    return return_instructions
+
+def execute_180_degree_turn():
+    """Execute a 180-degree turn using gyroscope to measure the angle."""
+    global delivery_stop_flag, current_angle, ultrasonic_monitoring
+    
+    # Temporarily pause ultrasonic monitoring to avoid I2C bus contention
+    original_ultrasonic_state = ultrasonic_monitoring
+    ultrasonic_monitoring = False
+    print("Temporarily pausing ultrasonic monitoring for turn...")
+    
+    # Allow a moment for the monitoring thread to recognize the state change
+    time.sleep(0.2)
+    
+    reset_angle()
+    print("\nExecuting 180-degree turn...")
+    
+    # Start turning right
+    turn_right()
+    
+    # Track the angle until we reach the target
+    start_time = time.time()
+    target_reached = False
+    
+    while not target_reached and not delivery_stop_flag:
+        try:
+            # Update angle
+            update_angle()
+            
+            # Check if we've reached target
+            if abs(current_angle) >= 165:
+                target_reached = True
+            
+            # Safety timeout after 5 seconds
+            if time.time() - start_time > 5:
+                print("Timeout reached - stopping 180-degree turn")
+                break
+                
+            time.sleep(0.01)  # Short sleep to reduce CPU usage
+        except Exception as e:
+            print(f"Error during turn angle measurement: {e}")
+            # Continue trying despite errors
+            time.sleep(0.05)
+    
+    # Stop turning
+    stop()
+    
+    # Calculate final time
+    final_time = time.time() - start_time
+    final_angle = current_angle
+    
+    print(f"180-degree turn completed in {final_time:.2f} seconds (final angle: {final_angle:.2f}°)")
+    
+    # Allow gyroscope readings to stabilize before continuing
+    time.sleep(0.3)
+    
+    # Restore ultrasonic monitoring to its original state
+    ultrasonic_monitoring = original_ultrasonic_state
+    print(f"Ultrasonic monitoring restored to: {'active' if original_ultrasonic_state else 'inactive'}")
+    
+    return final_time
+
+
+def execute_return_journey(instruction_set, client):
+    """Execute the return journey and notify when complete."""
+    global delivery_in_progress, delivery_stop_flag, active_command, current_speed
+    
+    try:
+        # Parse the instruction set
+        instructions = instruction_set.get('instruction_set', [])
+        original_speed = current_speed
+        
+        # Set delivery flag and force 100% speed for return journey
+        delivery_in_progress = True
+        delivery_stop_flag = False
+        current_speed = 100
+        
+        if not instructions:
+            print("No instructions found in the return instruction set.")
+            return
+        
+        print(f"Starting return journey with {len(instructions)} instructions (Speed: 100%)")
+        stop()
+        
+        # IMPORTANT: No recalibration here - just like in all_in31.py
+        # Simple reset is enough
+        time.sleep(0.5)  # Brief pause after stopping
+        reset_angle()
+        
+        # Add the return journey beep
+        return_journey_beep()
+
+        # FIRST 180-DEGREE TURN: Turn around to start return journey
+        print("\nExecuting first 180-degree turn to begin return journey...")
+        
+        # Execute gyroscope-based 180-degree turn with ultrasonic monitoring paused
+        execute_180_degree_turn()
+        
+        # Reset angle after the turn
+        reset_angle()
+        
+        # Execute each command in the instruction set
+        for idx, instruction in enumerate(instructions):
+            # Skip the first instruction if it was a turn (now handled with fixed duration)
+            if idx == 0 and instruction.get('command', '').lower() in ['right', 'left']:
+                continue
+                
+            # Check if return journey was canceled
+            if delivery_stop_flag:
+                print("Return journey stopped by obstacle or manual override")
+                break
+                
+            command = instruction.get('command', '').lower()
+            duration = float(instruction.get('duration', 0))
+            
+            print(f"\nExecuting return step {idx+1}/{len(instructions)}: {command} for {duration} seconds")
+            
+            # Execute the appropriate command with turbo drift compensation for forward
+            if command == 'forward':
+                forward(speed=current_speed)
+            elif command == 'backward':
+                backward()
+            elif command == 'right':
+                turn_right()
+            elif command == 'left':
+                turn_left()
+            elif command == 'stop':
+                stop()
+            else:
+                print(f"Unknown command: {command}")
+                continue
+            
+            # Wait for the specified duration, checking for obstacles every 0.1 seconds
+            elapsed = 0
+            while elapsed < duration and not delivery_stop_flag:
+                time.sleep(0.1)
+                elapsed += 0.1
+            
+            # If we didn't complete the duration due to a stop flag, break the loop
+            if delivery_stop_flag:
+                # Add this condition to check if it was due to an obstacle
+                if obstacleDetected:
+                    print("Return journey stopped due to obstacle detection")
+                else:
+                    print("Return journey stopped by manual override")
+                    
+                print("Return journey interrupted")
+                break
+        
+        # Stop motors after completing all instructions
+        stop()
+        
+        # SECOND 180-DEGREE TURN: Turn around to face original direction
+        if not delivery_stop_flag:
+            print("\nExecuting second 180-degree turn to face original direction...")
+            
+            # Pause briefly between movements
+            time.sleep(0.5)
+            
+            # Execute gyroscope-based 180-degree turn
+            execute_180_degree_turn()
+        
+        # Send "arrived" message on status topic only after final turn
+        if not delivery_stop_flag:
+            print("Return journey completed! Sending 'arrived' status.")
+            client.publish("/khanfar/status", "arrived")
+        
+    except Exception as e:
+        print(f"Error executing return journey: {str(e)}")
+    finally:
+        # Reset delivery flags
+        delivery_in_progress = False
+        delivery_stop_flag = False
+        
+        # Reset speed to original
+        current_speed = original_speed
+
+# Main function
+def main():
+    global mqtt_client  # Make the client accessible
+    
+    try:
+        print("Starting main function...")
+        
+        # Initialize gyroscope
+        print("Initializing gyroscope...")
+        init_gyroscope()
+        # Initialize buzzer
+        print("Initializing buzzer...")
+        init_buzzer()
+        # Initialize ultrasonic sensors
+        print("Initializing ultrasonic sensors...")
+        init_ultrasonic_sensors()
+
+        # Create MQTT client instance
+        print("Creating MQTT client...")
+        client = mqtt.Client()
+        mqtt_client = client  # Store client in global variable
+        
+        # Assign callback functions
+        print("Assigning callbacks...")
+        client.on_connect = on_connect
+        client.on_message = on_message
+        client.on_disconnect = on_disconnect
+        
+        # Set will message (last testament)
+        print("Setting will message...")
+        client.will_set("/khanfar/control/status", "Car offline", qos=1, retain=True)
+        
+        # Make sure motors are stopped initially
+        print("Stopping motors initially...")
+        stop()
+        
+        # Connect to the broker
+        print(f"Connecting to MQTT broker at {broker_address}:{broker_port}...")
+        try:
+            client.connect(broker_address, broker_port, 60)
+            print("Connection attempt made")
+        except Exception as e:
+            print(f"Error connecting to MQTT broker: {e}")
+            return
+        
+        # Publish online status
+        try:
+            client.publish("/khanfar/control/status", "Car online", qos=1, retain=True)
+            print("Published online status")
+        except Exception as e:
+            print(f"Error publishing status: {e}")
+        
+        # Start gyroscope update in a separate thread
+        print("Starting gyroscope update thread...")
+        gyro_thread = threading.Thread(target=gyroscope_update_loop, args=(client,))
+        gyro_thread.daemon = True  # Thread will exit when main thread exits
+        gyro_thread.start()
+        print("Gyroscope thread started")
+        
+        # Start package monitoring in a separate thread
+        print("Starting package monitoring thread...")
+        package_thread = threading.Thread(target=monitor_package)
+        package_thread.daemon = True
+        package_thread.start()
+        
+        # Start ultrasonic sensor monitoring in a separate thread
+        print("Starting ultrasonic sensor monitoring thread...")
+        ultrasonic_thread = threading.Thread(target=monitor_ultrasonic_sensors)
+        ultrasonic_thread.daemon = True
+        ultrasonic_thread.start()
+
+        # Start network loop
+        print("Starting MQTT subscription. Press Ctrl+C to exit.")
+        print(f"Current speed setting: {current_speed}% (Turbo mode: {'ON' if turbo_mode else 'OFF'})")
+        print(f"Debug mode: {'ON' if DEBUG_MODE else 'OFF'}")
+        print("Car control, path recording, delivery execution, and gyroscope straight-line correction are active")
+        print("IR sensor package monitoring is active")
+        print("Ultrasonic sensor obstacle detection is active")
+
+        print("Starting MQTT loop_forever()...")
+        client.loop_forever()
+        
+    except KeyboardInterrupt:
+        print("\nExiting program due to keyboard interrupt")
+        stop()
+        if mqtt_client:
+            mqtt_client.publish("/khanfar/control/status", "Car offline", qos=1, retain=True)
+            mqtt_client.disconnect()
+            mqtt_client.loop_stop()
+        
+    except Exception as e:
+        print(f"Error in main function: {e}")
+        import traceback
+        traceback.print_exc()
+        
+    finally:
+        # Add ultrasonic monitoring flag to ensure thread stops
+        global ultrasonic_monitoring
+        ultrasonic_monitoring = False
+        # Clean up
+        print("Cleaning up resources...")
+        stop()
+        pwm_right.stop()
+        pwm_left.stop()
+        GPIO.cleanup()
+        print("Program stopped and GPIO cleaned up")
+
+# Fix the if __name__ syntax
+if __name__ == "__main__":
+    print("Starting main execution...")
+    main()
+    print("Script execution completed")
