@@ -80,7 +80,6 @@ Robot → MQTT → App → Firebase → UI
   - delivery history
 - UI updates live based on Firebase + MQTT events
 
-If you'd like, I can add a diagram image here and generate it for you.
 
 ---
 
